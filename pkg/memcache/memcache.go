@@ -1,10 +1,17 @@
-// Package memchace is a simple in-memory key-value store.
+// Package memcache is a simple in-memory key-value store.
 package memcache
 
 import (
+	"errors"
 	"hash/fnv"
 	"sync"
+	"sync/atomic"
 	"time"
+)
+
+var (
+	ErrClosed     = errors.New("memcache: cache is closed")
+	ErrInvalidKey = errors.New("memcache: invalid key")
 )
 
 const shardCount = 16
@@ -26,9 +33,10 @@ type Cache[V any] struct {
 	now    func() time.Time
 	stop   chan struct{}
 	once   sync.Once
+	closed atomic.Bool
 }
 
-// New returns a new cache with the given TTL
+// New returns a new cache with the given TTL.
 func New[V any](ttl, sweepEvery time.Duration) *Cache[V] {
 	c := &Cache[V]{
 		ttl:  ttl,
@@ -37,8 +45,7 @@ func New[V any](ttl, sweepEvery time.Duration) *Cache[V] {
 	}
 
 	for i := range c.shards {
-		c.shards[i] = &shard[V]{
-			items: make(map[string]entry[V])}
+		c.shards[i] = &shard[V]{items: make(map[string]entry[V])}
 	}
 
 	go c.janitor(sweepEvery)
@@ -51,42 +58,55 @@ func (c *Cache[V]) shardFor(key string) *shard[V] {
 	return c.shards[h.Sum32()%shardCount]
 }
 
-// SetTTL sets the value for key with a explicit TTL
-func (c *Cache[V]) SetTTL(key string, value V, ttl time.Duration) {
+// SetTTL sets the value for key with an explicit TTL.
+func (c *Cache[V]) SetTTL(key string, value V, ttl time.Duration) error {
+	if key == "" {
+		return ErrInvalidKey
+	}
+	if c.closed.Load() {
+		return ErrClosed
+	}
+
 	s := c.shardFor(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.items[key] = entry[V]{
-		value:     value,
-		expiresAt: c.now().Add(ttl),
-	}
+	s.items[key] = entry[V]{value: value, expiresAt: c.now().Add(ttl)}
+	return nil
 }
 
 // Get returns the value for key if it exists.
 func (c *Cache[V]) Get(key string) (V, bool) {
 	s := c.shardFor(key)
 	s.mu.RLock()
-	v, ok := s.items[key]
-	s.mu.Unlock()
+	e, ok := s.items[key]
+	s.mu.RUnlock()
 
-	if !ok || c.now().After(v.expiresAt) {
+	if !ok || c.now().After(e.expiresAt) {
 		var zero V
 		return zero, false
 	}
-
-	return v.value, true
+	return e.value, true
 }
 
-// Set sets the value for key
-func (c *Cache[V]) Set(key string, value V) {
-	c.SetTTL(key, value, c.ttl)
+// Set sets the value for key.
+func (c *Cache[V]) Set(key string, value V) error {
+	return c.SetTTL(key, value, c.ttl)
 }
 
 // Increment adds delta to an integer counter stored at key and returns
 // the new total. Counters share the default TTL, refreshed on write.
-// It is the primitive behind velocity checks
-func (c *Cache[V]) Increment(key string, counter func(current V, exists bool) V) V {
+// It is the primitive behind velocity checks.
+func (c *Cache[V]) Increment(key string, counter func(current V, exists bool) V) (V, error) {
+	if key == "" {
+		var zero V
+		return zero, ErrInvalidKey
+	}
+	if c.closed.Load() {
+		var zero V
+		return zero, ErrClosed
+	}
+
 	s := c.shardFor(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -95,15 +115,12 @@ func (c *Cache[V]) Increment(key string, counter func(current V, exists bool) V)
 	valid := ok && !c.now().After(e.expiresAt)
 
 	next := counter(e.value, valid)
-	s.items[key] = entry[V]{
-		value:     next,
-		expiresAt: c.now().Add(c.ttl),
-	}
+	s.items[key] = entry[V]{value: next, expiresAt: c.now().Add(c.ttl)}
 
-	return next
+	return next, nil
 }
 
-// Len returns the number of items in the cache
+// Len returns the number of items in the cache.
 func (c *Cache[V]) Len() int {
 	var total int
 	for _, s := range c.shards {
@@ -114,9 +131,13 @@ func (c *Cache[V]) Len() int {
 	return total
 }
 
-// Close closes the cache and stops the sweeper
+// Close closes the cache and stops the sweeper.
 func (c *Cache[V]) Close() error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
 	c.once.Do(func() {
+		c.closed.Store(true)
 		close(c.stop)
 	})
 	return nil
